@@ -1,100 +1,113 @@
-import google.generativeai as genai
+import time
+from typing import List, Dict, Any
+from openai import OpenAI
+from config import OPENROUTER_BASE_URL, FREE_MODELS, DEFAULT_MODEL
 
-class BaseAgent:
-    def __init__(self, model, name, persona):
-        self.model = model
-        self.name = name
-        self.persona = persona
+class OpenRouterAgentRunner:
+    def __init__(self, api_key: str, model_name: str = DEFAULT_MODEL):
+        self.client = OpenAI(
+            base_url=OPENROUTER_BASE_URL,
+            api_key=api_key,
+            default_headers={
+                "HTTP-Referer": "https://legacylens.ai",
+                "X-Title": "LegacyLens AI Code Archeologist"
+            }
+        )
+        self.model_name = model_name
 
-    def work(self, input_data):
-        print(f"{self.name} is thinking..")
+    def call_agent(self, system_prompt: str, user_prompt: str, retry_count: int = 3) -> str:
+        """Executes agent call with OpenRouter model fallback on rate limits."""
+        models_to_try = [self.model_name] + [m for m in FREE_MODELS if m != self.model_name]
         
-        # --- SAFETY FEATURE: CONTEXT TRUNCATION GUARD ---
-        # If the input is massive (e.g., a huge repo), we cut it to a safe, fast size.
-        # 800,000 characters is roughly 200,000 tokens, which is fast and reliable.
-        MAX_CHARS = 800000 
-        if len(input_data) > MAX_CHARS:
-            print(f"Warning: Input context length is {len(input_data)} chars. Truncating to {MAX_CHARS}...")
-            input_data = input_data[:MAX_CHARS] + "\n...[CONTEXT TRUNCATED DUE TO SIZE]..."
-        # --------------------------------------------------
-        
-        prompt = f"""
-        SYSTEM_IDENTITY:
-        {self.persona}
+        for model in models_to_try:
+            for attempt in range(retry_count):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.2,
+                        max_tokens=4000
+                    )
+                    return response.choices.message.content
+                except Exception as e:
+                    print(f"[OpenRouter Warning] Model {model} attempt {attempt+1} failed: {e}")
+                    time.sleep(2)
+        return "Error: Failed to process request across available OpenRouter free models."
 
-        INPUT_DATA :
-        { input_data}
-        """
-        try:
-            response = self.model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            # Added better error handling feedback
-            print(f"ERROR!! Agent failed to generate content: {e}")
-            return f"Error: Agent '{self.name}' failed to process data. Reason: {e}"
-    
-# Code Analyzing Agent
-class AnalystAgent(BaseAgent):
-    def __init__(self, model):
-        super().__init__(model, "Analyst","""
-            You are a Senior Code Analyst. Your job is NOT to write documentation, but to READ raw code and extract facts.
-            Output a structured summary containing:
-            1. List of all languages used.
-            2. The probable entry point of the app (eg., main.py, index.js).
-            3. A list of external libraries/dependencies imported.
-            4. A high level description of the data flow.              
-            
-            Be concise and factual.
-            """)
-        
-# Code reviewing agent(Tech lead)
-class TechLeadAgent(BaseAgent):
-    def __init__(self, model):
-        super().__init__(model, "Tech Lead","""
-            You are a cynical Technical Lead. You are reviewing a codebase analysis.
 
-            Identify 3 potential "red flags" or areas of concern, such as:
-            Security risks(hardcodes keys).
-            Deprecated libraries.
-            Lack of error handling.
-            Poor variable naming.
-            
-            If the code looks perfect admit it, but try to find improvements
-             """ )
+class LegacyLensMultiAgentPipeline:
+    def __init__(self, api_key: str):
+        self.runner = OpenRouterAgentRunner(api_key=api_key)
 
-# technical writing agent
-class WriterAgent(BaseAgent):
-    def __init__(self, model):
-        super().__init__(model, "Writer","""
-            You are a Technical Writer specializing in documentation for legacy systems.
-            
-            You will receive:
-            1. a code analysis.
-            2. A tech Leads critique.
-            
-            Your goal: Write a professtional README.md file.
-            Structure: 
-            #[Project Name]
-            ## Overview
-            ## Tech stack
-            ## Key Features
-            ## Maintainace Warning(Include the tech leads red flags here)
-            ## Getting started
-            """)
-        
-class DiagramAgent(BaseAgent):
-    def __init__(self, model):
-        super().__init__(model, "Architect", """
-            You are a Senior Software Architect. 
-            Your goal is to map the dependencies of a legacy codebase using Mermaid.js.
-            
-            STRICT RULES:
-            1. Use ONLY the actual filenames found in the codebase. DO NOT invent files like "AI_Pipeline" or "Core" if they don't exist.
-            2. If 'app.py' imports 'agents.py', draw: app.py --> agents.py
-            3. Use the 'graph TD' layout.
-            4. Style the nodes:
-                - Use [Square Brackets] for Python/Code files.
-                - Use (Round Brackets) for External Libraries (like streamlit, google-genai).
-                
-            Output ONLY the Mermaid code. No markdown backticks.
-        """)
+    def agent_code_analyst(self, batch_files: List[Dict[str, Any]]) -> str:
+        """Agent 1: Map Phase - Analyzes code batches for business logic, UI controls, and SQL."""
+        code_snippets = ""
+        for item in batch_files:
+            try:
+                with open(item["path"], "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()[:8000]  # Cap content length per file
+                    code_snippets += f"\n--- File: {item['relative_path']} ---\n{content}\n"
+            except Exception:
+                continue
+
+        system_prompt = """You are a Senior Java Enterprise Architect. Analyze the provided Java JSP, Class, JavaBean, and XML code snippets.
+Extract and summarize:
+1. UI Components, Form Actions, and Request Parameters (from JSPs).
+2. Business Logic, Calculations, State Rules, and Validation Criteria (from Beans/Classes).
+3. Data Access Layer (SQL queries, DAOs, Tables accessed).
+4. External Service Integration or Session Attributes."""
+
+        return self.runner.call_agent(system_prompt, f"Analyze this code batch:\n{code_snippets}")
+
+    def agent_frs_synthesizer(self, module_analyses: List[str]) -> str:
+        """Agent 2: Reduce Phase - Synthesizes IEEE 830 / ISO 29148 Compliant FRS."""
+        combined_analysis = "\n\n".join(module_analyses[:20])  # Consolidate top summaries
+
+        system_prompt = """You are a Lead Systems Analyst. Generate a formal, fully IEEE 830 / ISO 29148 compliant Functional Requirements Specification (FRS) based on the provided codebase analysis.
+
+Your output MUST follow this exact IEEE structure:
+1. INTRODUCTION
+   1.1 Purpose
+   1.2 Scope of Legacy Application
+   1.3 Definitions, Acronyms, and Abbreviations
+2. GENERAL DESCRIPTION
+   2.1 Product Perspective & User Characteristics
+   2.2 User Roles & Security Matrix
+   2.3 General Constraints
+3. SPECIFIC FUNCTIONAL REQUIREMENTS (Module by Module)
+   - Feature/Module ID & Name
+   - User Interface & Input Validation Rules (derived from JSPs)
+   - Step-by-Step Business Logic & Workflows (derived from JavaBeans/Classes)
+   - System Outputs & Screen Descriptions
+4. BUSINESS RULES CATALOG
+   - Comprehensive table of business constraints, calculations, and conditional rules."""
+
+        return self.runner.call_agent(system_prompt, f"Generate IEEE FRS document based on this codebase analysis:\n{combined_analysis}")
+
+    def agent_srs_synthesizer(self, module_analyses: List[str], catalog_stats: Dict[str, Any]) -> str:
+        """Agent 3: Reduce Phase - Synthesizes IEEE 830 Compliant SRS with Mermaid diagrams."""
+        combined_analysis = "\n\n".join(module_analyses[:20])
+
+        system_prompt = """You are a Principal Software Architect. Generate a formal, fully IEEE 830 compliant Software Requirements Specification (SRS) based on the provided codebase analysis.
+
+Your output MUST follow this exact IEEE structure:
+1. SYSTEM ARCHITECTURE & TECH STACK
+   1.1 High-Level Architecture Pattern (MVC, Layered)
+   1.2 Frameworks, Application Server, & Java Standards
+2. EXTERNAL INTERFACE REQUIREMENTS
+   2.1 User Interfaces (JSP, Custom Tags)
+   2.2 Hardware & Software Interfaces
+   2.3 Communications Interfaces (Servlets, REST/SOAP)
+3. SYSTEM DESIGN & COMPONENT SPECIFICATIONS
+   - Package breakdown & JavaBean scope
+   - Class interactions & Control Flow (Include Mermaid.js Sequence Diagrams)
+4. DATA ARCHITECTURE & DATABASE SPECIFICATIONS
+   - Database Tables, Schema Inferences, Foreign Keys
+   - Mermaid.js Entity-Relationship (ER) Diagram
+5. NON-FUNCTIONAL REQUIREMENTS
+   - Performance, Security (Session/Auth), Reliability, Maintainability."""
+
+        return self.runner.call_agent(system_prompt, f"Generate IEEE SRS document based on stats {catalog_stats} and analysis:\n{combined_analysis}")
