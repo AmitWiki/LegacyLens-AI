@@ -1,101 +1,79 @@
 import os
-import subprocess
 import shutil
-import stat  # <--- NEW IMPORT needed for the fix
+import patoolib
+import rarfile
+import zipfile
+from typing import List, Dict, Any
+from config import ALLOWED_EXTENSIONS, MAX_FILE_SIZE_MB
 
-# Files we want to read
-ALLOWED_EXTENSIONS = {'.py', '.js', '.ts', '.java', '.c', '.cpp', '.h', '.css', '.html', '.md', '.json'}
+class LargeCodebaseIngestor:
+    def __init__(self, extract_dir: str = "./extracted_workspace"):
+        self.extract_dir = extract_dir
+        os.makedirs(self.extract_dir, exist_ok=True)
 
-# Folders we ALWAYS ignore
-IGNORE_DIRS = {'node_modules', 'venv', '.git', '__pycache__', 'dist', 'build'}
-
-# --- HELPER: FORCE DELETE FOR WINDOWS ---
-def on_rm_error(func, path, exc_info):
-    """
-    Error handler for shutil.rmtree.
-    If the error is due to an access error (read-only file),
-    it changes the file to be writable and attempts the delete again.
-    """
-    try:
-        os.chmod(path, stat.S_IWRITE)
-        os.unlink(path)
-    except Exception as e:
-        print(f"⚠️ Could not delete {path}: {e}")
-
-def get_code_from_path(path_or_url):
-    """
-    Checks if the input is a GitHub URL. 
-    If yes: Clones it to a temporary folder and returns that folder path.
-    If no: Returns the original local path.
-    """
-    if path_or_url.startswith("http"): # Allow http or https
-        # Create a folder name based on the repo name
-        repo_name = path_or_url.split("/")[-1].replace(".git", "")
-        
-        # Ensure the temp directory exists
-        os.makedirs("./temp_repos", exist_ok=True)
-        local_path = f"./temp_repos/{repo_name}"
-        
-        # Clean up if it already exists
-        if os.path.exists(local_path):
-            print(f"🔄 Cleaning up old version of {repo_name}...")
-            # --- THE FIX IS HERE: Added onerror=on_rm_error ---
-            shutil.rmtree(local_path, onerror=on_rm_error)
+    def extract_archives(self, archive_paths: List[str]) -> str:
+        """Extracts .rar, .zip, and archive files recursively into workspace."""
+        for path in archive_paths:
+            filename = os.path.basename(path)
+            target_subfolder = os.path.join(self.extract_dir, os.path.splitext(filename))
+            os.makedirs(target_subfolder, exist_ok=True)
             
-        print(f"⬇️ Cloning {repo_name} from GitHub...")
-        try:
-            subprocess.run(["git", "clone", path_or_url, local_path], check=True)
-            print(f"✅ Successfully cloned to {local_path}")
-            return local_path
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Failed to clone repository: {e}")
-            return path_or_url # Fallback to original input on error
-    
-    # If it's not a URL, just return it as a local path
-    return path_or_url
-
-def get_codebase_context(path_or_url):
-    """
-    Walks through the directory, reads code files, and returns a single string
-    formatted with file delimiters.
-    """
-    
-    # Resolve the URL to a local folder path BEFORE walking it.
-    root_dir = get_code_from_path(path_or_url)
-
-    all_code = []
-    
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        # modify dirnames in-place to ignore excluded folders
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-        
-        for filename in filenames:
-            file_ext = os.path.splitext(filename)[1]
-            
-            if file_ext in ALLOWED_EXTENSIONS:
-                file_path = os.path.join(dirpath, filename)
+            try:
+                if path.endswith('.rar'):
+                    rf = rarfile.RarFile(path)
+                    rf.extractall(target_subfolder)
+                elif path.endswith('.zip'):
+                    with zipfile.ZipFile(path, 'r') as zip_ref:
+                        zip_ref.extractall(target_subfolder)
+                else:
+                    patoolib.extract_archive(path, outdir=target_subfolder)
+            except Exception as e:
+                print(f"[Warning] Failed extracting {path}: {str(e)}")
                 
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        
-                        # Format clearly for the LLM
-                        formatted_block = (
-                            f"\n\n--- START OF FILE: {file_path} ---\n"
-                            f"{content}\n"
-                            f"--- END OF FILE: {filename} ---\n"
-                        )
-                        all_code.append(formatted_block)
-                        
-                except Exception as e:
-                    print(f"Skipping file {filename} due to error: {e}")
+        return self.extract_dir
 
-    return "".join(all_code)
+    def scan_and_catalog(self) -> Dict[str, Any]:
+        """Scans extracted code, filters out binaries/jars, and builds a modular catalog."""
+        catalog = {
+            "presentation_layer": [],  # .jsp, .jspf, .tag
+            "business_layer": [],      # .java (Beans, Servlets, Services)
+            "config_layer": [],        # web.xml, context.xml, properties
+            "database_layer": []       # SQL scripts, DAOs
+        }
 
-if __name__ == "__main__":
-    print("Testing ingestion...")
-    repo_url = "https://github.com/octocat/Hello-World" 
-    print(f"Testing with URL: {repo_url}")
-    result = get_codebase_context(repo_url)
-    print(f"\n--- Result Length: {len(result)} characters ---")
-    print("Preview:\n", result[:500])
+        total_files = 0
+        total_size_bytes = 0
+
+        for root, _, files in os.walk(self.extract_dir):
+            for file in files:
+                ext = os.path.splitext(file)[4].lower()
+                full_path = os.path.join(root, file)
+                
+                # Filter by extension and file size
+                if ext in ALLOWED_EXTENSIONS:
+                    file_size = os.path.getsize(full_path)
+                    if file_size <= MAX_FILE_SIZE_MB * 1024 * 1024:
+                        total_files += 1
+                        total_size_bytes += file_size
+                        
+                        relative_path = os.path.relpath(full_path, self.extract_dir)
+                        item = {"path": full_path, "relative_path": relative_path, "size": file_size}
+
+                        if ext in ['.jsp', '.jspf', '.tag', '.html']:
+                            catalog["presentation_layer"].append(item)
+                        elif ext in ['.java']:
+                            catalog["business_layer"].append(item)
+                        elif ext in ['.xml', '.properties', '.tld']:
+                            catalog["config_layer"].append(item)
+                        elif ext in ['.sql']:
+                            catalog["database_layer"].append(item)
+
+        catalog["stats"] = {
+            "total_files": total_files,
+            "total_size_mb": round(total_size_bytes / (1024 * 1024), 2)
+        }
+        return catalog
+
+    def create_batches(self, file_list: List[Dict[str, Any]], batch_size: int = 15) -> List[List[Dict[str, Any]]]:
+        """Splits file catalog into manageable batches for OpenRouter agents."""
+        return [file_list[i:i + batch_size] for i in range(0, len(file_list), batch_size)]
